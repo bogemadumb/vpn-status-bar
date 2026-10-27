@@ -1,0 +1,171 @@
+#!/bin/bash
+# Privileged part of the VPN. Called only through sudo (NOPASSWD in /etc/sudoers.d/vpn).
+set -u
+LABEL=dev.vpnstatusbar.singbox
+PLIST=/Library/LaunchDaemons/$LABEL.plist
+DIR=/usr/local/etc/singbox
+CONF=$DIR/config.json
+SINGBOX=/opt/homebrew/bin/sing-box
+PY=/usr/bin/python3
+# server.env: SERVER_IP=<адрес вашего VPS>
+[ -r "$DIR/server.env" ] && . "$DIR/server.env"
+
+running() { launchctl print system/$LABEL 2>/dev/null | grep -q "state = running"; }
+
+tunnel_works() {
+  local i code
+  for i in $(seq 1 25); do
+    sleep 1
+    running || continue
+    /sbin/ifconfig | grep -q "inet 172.19" || continue
+    code=$(curl -s -o /dev/null -m 5 -w '%{http_code}' https://www.gstatic.com/generate_204)
+    [ "$code" = "204" ] && return 0
+  done
+  return 1
+}
+
+case "${1:-}" in
+  on)
+    launchctl enable system/$LABEL 2>/dev/null
+    launchctl bootstrap system "$PLIST" 2>/dev/null || launchctl kickstart -k system/$LABEL
+    ;;
+  off)
+    "$0" killswitch off >/dev/null 2>&1
+    launchctl bootout system/$LABEL 2>/dev/null
+    launchctl disable system/$LABEL 2>/dev/null
+    ;;
+  restart)
+    launchctl kickstart -k system/$LABEL
+    ;;
+  show)
+    # Config with secrets replaced by placeholders: __UUID__, __CLASH_SECRET__.
+    "$PY" - "$CONF" <<'EOF'
+import json, sys
+c = json.load(open(sys.argv[1]))
+for ob in c.get("outbounds", []):
+    if isinstance(ob.get("uuid"), str): ob["uuid"] = "__UUID:%s__" % ob.get("tag", "")
+def walk(o):
+    if isinstance(o, dict):
+        for k, v in o.items():
+            if k == "uuid" and isinstance(v, str) and v.startswith("__UUID"):
+                pass
+            elif k in ("uuid", "password", "private_key", "psk"):
+                o[k] = "__UUID__" if k == "uuid" else "__MASKED__"
+            elif k == "secret":
+                o[k] = "__CLASH_SECRET__"
+            else:
+                walk(v)
+    elif isinstance(o, list):
+        for x in o:
+            walk(x)
+walk(c)
+print(json.dumps(c, ensure_ascii=False, indent=2))
+EOF
+    ;;
+  apply)
+    # apply <staged.json>: placeholders __UUID__ are filled from the current config,
+    # the clash secret may be given literally in the staged file (it is not in the current one yet).
+    SRC="${2:-}"
+    if [ -z "$SRC" ] || [ ! -f "$SRC" ] || [ -L "$SRC" ]; then
+      echo "apply: need a regular staged file" >&2; exit 2
+    fi
+    STAMP=$(date +%Y%m%d-%H%M%S)
+    NEW=$(mktemp "$DIR/.staged.XXXXXX") || exit 3
+    chmod 600 "$NEW"
+    if ! "$PY" - "$CONF" "$SRC" "$NEW" <<'EOF'
+import json, sys
+cur = json.load(open(sys.argv[1]))
+new = json.load(open(sys.argv[2]))
+uuids, secrets = [], []
+def collect(o):
+    if isinstance(o, dict):
+        for k, v in o.items():
+            if k == "uuid" and isinstance(v, str): uuids.append(v)
+            elif k == "secret" and isinstance(v, str): secrets.append(v)
+            else: collect(v)
+    elif isinstance(o, list):
+        for x in o: collect(x)
+collect(cur)
+by_tag = {ob.get("tag"): ob["uuid"] for ob in cur.get("outbounds", []) if isinstance(ob.get("uuid"), str)}
+def fill(o):
+    if isinstance(o, dict):
+        for k, v in o.items():
+            if v == "__UUID__":
+                if len(set(uuids)) != 1:
+                    sys.exit("apply: __UUID__ is ambiguous, %d uuids in current config; use __UUID:<tag>__" % len(set(uuids)))
+                o[k] = uuids[0]
+            elif isinstance(v, str) and v.startswith("__UUID:") and v.endswith("__"):
+                t = v[7:-2]
+                if t not in by_tag: sys.exit("apply: no outbound %r with uuid in current config" % t)
+                o[k] = by_tag[t]
+            elif v == "__CLASH_SECRET__":
+                if not secrets: sys.exit("apply: __CLASH_SECRET__ but no secret in current config")
+                o[k] = secrets[0]
+            else: fill(v)
+    elif isinstance(o, list):
+        for x in o: fill(x)
+fill(new)
+json.dump(new, open(sys.argv[3], "w"), ensure_ascii=False, indent=2)
+EOF
+    then rm -f "$NEW"; exit 4; fi
+    if ! "$SINGBOX" check -c "$NEW"; then
+      echo "apply: sing-box check failed, nothing changed" >&2; rm -f "$NEW"; exit 5
+    fi
+    cp -p "$CONF" "$CONF.backup-$STAMP"
+    mv "$NEW" "$CONF"; chown root:wheel "$CONF"; chmod 600 "$CONF"
+    launchctl kickstart -k system/$LABEL
+    if tunnel_works; then
+      echo "apply: ok, backup $CONF.backup-$STAMP"
+    else
+      echo "apply: tunnel did not come up in 25 s, rolling back" >&2
+      cp -p "$CONF.backup-$STAMP" "$CONF"
+      launchctl kickstart -k system/$LABEL
+      tunnel_works && echo "apply: rolled back, tunnel ok" >&2 || echo "apply: rolled back, tunnel STILL DOWN" >&2
+      exit 6
+    fi
+    ;;
+  killswitch)
+    # killswitch on|off|status — pf rules in a sub-anchor of com.apple/* (evaluated by the stock /etc/pf.conf).
+    ANCHOR="com.apple/250.VPNStatusBarKillSwitch"
+    RULES=/usr/local/etc/singbox/killswitch.pf
+    TOKEN=/var/run/vpnstatusbar-pf.token
+    case "${2:-status}" in
+      on)
+        [ -n "${SERVER_IP:-}" ] || { echo "killswitch: SERVER_IP не задан в $DIR/server.env" >&2; exit 8; }
+        UTUNS=$(for i in $(seq 0 15); do printf "utun%d " $i; done)
+        cat > "$RULES" <<PF
+pass quick on lo0 all
+pass quick on { $UTUNS} all
+pass out quick inet proto udp from any port 68 to any port 67
+pass out quick inet to { 10.0.0.0/8, 172.16.0.0/12, 192.168.0.0/16, 169.254.0.0/16, 224.0.0.0/4, 255.255.255.255 }
+pass out quick inet6 to { fe80::/10, ff00::/8 }
+pass out quick inet to $SERVER_IP
+pass out quick inet to 17.0.0.0/8
+pass out quick proto { tcp, udp } all user root
+block drop out quick inet all
+block drop out quick inet6 all
+PF
+        chmod 644 "$RULES"
+        pfctl -a "$ANCHOR" -f "$RULES" 2>/dev/null || { echo "killswitch: pf load failed" >&2; exit 7; }
+        if [ ! -s "$TOKEN" ]; then
+          pfctl -E 2>&1 | awk '/Token/{print $NF}' > "$TOKEN"
+        fi
+        echo "killswitch: on"
+        ;;
+      off)
+        pfctl -a "$ANCHOR" -F all 2>/dev/null
+        if [ -s "$TOKEN" ]; then pfctl -X "$(cat "$TOKEN")" >/dev/null 2>&1; fi
+        rm -f "$TOKEN"
+        echo "killswitch: off"
+        ;;
+      status)
+        if pfctl -a "$ANCHOR" -s rules 2>/dev/null | grep -q "block drop out"; then echo "killswitch: on"; else echo "killswitch: off"; fi
+        ;;
+      *) echo "usage: vpn-ctl killswitch on|off|status" >&2; exit 1 ;;
+    esac
+    ;;
+  *)
+    echo "usage: vpn-ctl on|off|restart|show|apply <staged.json>|killswitch on|off|status" >&2
+    exit 1
+    ;;
+esac

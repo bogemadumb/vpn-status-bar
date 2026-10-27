@@ -1,0 +1,8 @@
+.DS_Store
+build/
+*.app
+*.zip
+.build/
+config.json
+server.env
+*.backup-*

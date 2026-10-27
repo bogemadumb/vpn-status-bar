@@ -1,0 +1,9 @@
+{
+  "server_ip": "203.0.113.10",
+  "ssh_user": "root",
+  "ssh_key": "~/.ssh/vpn_status_bar",
+  "server_country_code": "FI",
+  "trace_host": "www.cloudflare.com",
+  "local_sites": ["https://example.org"],
+  "external_sites": ["https://www.wikipedia.org"]
+}
